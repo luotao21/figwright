@@ -4,7 +4,7 @@ import { resumeHostYield } from './cooperative.js';
 import { dispatchSandboxMessage } from './dispatcher.js';
 import { createSandboxHandlers } from './handlers/registry.js';
 import { createPanelController } from './panel.js';
-import { createResponsiveLayoutController } from './responsive-layout.js';
+import { createPrivateResponsiveController } from './private-responsive-controller.js';
 
 const log = (msg: string): void => console.log(msg);
 
@@ -41,7 +41,7 @@ const emitContext = (): void => {
   figma.ui.postMessage(event);
 };
 
-const responsive = createResponsiveLayoutController(figma);
+const responsive = createPrivateResponsiveController(figma);
 responsive.start();
 figma.on('close', () => responsive.dispose());
 const handlers = createSandboxHandlers(figma, responsive);

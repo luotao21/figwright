@@ -4,10 +4,7 @@ import { z } from 'zod';
 import type { SandboxHandlers } from '../dispatcher.js';
 import { createIdempotencyCache, idempotent } from '../idempotency.js';
 import { withInstanceIdLookup } from '../node-lookup.js';
-import {
-  createResponsiveLayoutController,
-  type ResponsiveLayoutController,
-} from '../responsive-layout.js';
+import { createPrivateResponsiveController } from '../private-responsive-controller.js';
 import { createAddComponentPropertyHandler } from './add-component-property.js';
 import { createAddPageHandler } from './add-page.js';
 import { createAddVariableModeHandler } from './add-variable-mode.js';
@@ -135,10 +132,10 @@ const responsiveWireInput = ResponsiveLayoutConfigureInputSchema.extend({
 const responsiveGetInput = z.strictObject({});
 export const createSandboxHandlers = (
   figmaApi: typeof figma,
-  responsive: Pick<
-    ResponsiveLayoutController,
-    'configure' | 'get'
-  > = createResponsiveLayoutController(figmaApi),
+  responsive: {
+    configure(params: unknown): Promise<unknown>;
+    get(): unknown;
+  } = createPrivateResponsiveController(figmaApi),
 ): SandboxHandlers => {
   const figmaCtx = withInstanceIdLookup(figmaApi);
   const cache = createIdempotencyCache();
