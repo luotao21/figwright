@@ -3,10 +3,11 @@
 Agent skills that orchestrate Figwright's MCP tools. They are model-invoked: your agent loads one
 automatically when the task matches the skill's `description`.
 
-| Skill                                       | What it does                                                                                                      |
-| :------------------------------------------ | :---------------------------------------------------------------------------------------------------------------- |
-| [`figma-codegen`](./figma-codegen/SKILL.md) | Turn a Figma selection into framework-aware code, grounded on the project's stack and existing components/tokens. |
-| [`figma-build`](./figma-build/SKILL.md)     | Build a Figma design from code or a description, reusing the file's existing components/variables/styles.         |
+| Skill                                         | What it does                                                                                                                                      |
+| :-------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [`figma-codegen`](./figma-codegen/SKILL.md)   | Turn a Figma selection into framework-aware code, grounded on the project's stack and existing components/tokens.                                 |
+| [`figma-build`](./figma-build/SKILL.md)       | Build a Figma design from code or a description, reusing the file's existing components/variables/styles.                                         |
+| [`figma-optimize`](./figma-optimize/SKILL.md) | Audit and improve an existing Figma design against project rules, with measured findings, minimal repairs, and read-back/screenshot verification. |
 
 ## Install
 
@@ -14,7 +15,7 @@ Install across any supported agent (Claude Code, Cursor, Codex, Copilot, Windsur
 [`skills`](https://www.skills.sh) CLI — it pulls straight from this repo, no upload or registration:
 
 ```bash
-# both Figwright skills
+# all Figwright skills
 npx skills add awdr74100/figwright/skills
 
 # or a single skill
