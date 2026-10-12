@@ -42,11 +42,16 @@ const fixture = () => {
   const f = createResponsiveFixture('grid');
   Object.assign(f.api, { editorType: 'figma', mode: 'default' });
   Object.assign(f.api.root, { name: 'test' });
+  const rootData = new Map<string, string>();
+  f.root.getPluginData = (key: string) => rootData.get(key) ?? '';
+  f.root.setPluginData = (key: string, value: string) => rootData.set(key, value);
   f.root.parent = f.api.currentPage;
+  f.nodes.get('p').children.push(f.root);
   const main = f.makeNode('main', 'FRAME', f.root);
   const body = f.makeNode('body', 'FRAME', main);
   const section = f.makeNode('section', 'FRAME', body);
   f.frame.parent = section;
+  f.root.children = f.root.children.filter((n: SceneNode) => n !== f.frame);
   section.children.push(f.frame);
   const sidebar = f.makeNode('sidebar', 'INSTANCE', f.root);
   const header = f.makeNode('header', 'INSTANCE', body);
@@ -55,6 +60,12 @@ const fixture = () => {
   const tabs = f.makeNode('tabs', 'INSTANCE', nav);
   tabs.width = 512;
   nav.width = 480;
+  for (const n of f.nodes.values()) {
+    if (n.getPluginData !== undefined) continue;
+    const data = new Map<string, string>();
+    n.getPluginData = (key: string) => data.get(key) ?? '';
+    n.setPluginData = (key: string, value: string) => data.set(key, value);
+  }
   f.config.roots[0]!.base = [{ type: 'visibility', nodeId: 'i', values: { visible: false } }];
   f.writes.length = 0;
   const savePublic = (enabled: boolean) =>
@@ -70,9 +81,44 @@ const fixture = () => {
     f.saved.set('responsive_layout_v1', JSON.stringify({ enabled, config: legacyConfig }));
   const owner = (source: 'public' | 'private' | 'none') =>
     f.saved.set('responsive_layout_private_owner', JSON.stringify({ version: 1, source }));
-  const tick = async () => {
-    f.emitChange();
+  const tick = async (event?: NodeChangeEvent) => {
+    if (event === undefined) f.emitChange();
+    else
+      for (const cb of f.listeners.get('nodechange') ?? []) Reflect.apply(cb, undefined, [event]);
     await vi.advanceTimersByTimeAsync(120);
+  };
+  const cloneRoot = (source = f.root, prefix = 'copy') => {
+    const copied = new Map<string, any>();
+    const clone = (n: any, parent: any): any => {
+      const result = f.makeNode(`${prefix}-${n.id}`, n.type, parent);
+      copied.set(n.id, result);
+      result.name = n.name;
+      result.width = n.width;
+      result.visible = n.visible;
+      result.componentProperties = structuredClone(n.componentProperties);
+      if (n.layoutMode === 'GRID') {
+        result.gridColumnCount = n.gridColumnCount;
+        result.gridRowCount = n.gridRowCount;
+        result.gridColumnSizes = n.gridColumnSizes.map((t: any) =>
+          f.makeTrack(result.id, t.type, t.value),
+        );
+        result.gridRowSizes = n.gridRowSizes.map((t: any) =>
+          f.makeTrack(result.id, t.type, t.value),
+        );
+        result.gridAutoTracks = n.gridAutoTracks;
+        result.gridItemsPositioning = n.gridItemsPositioning;
+      }
+      result.layoutMode = n.layoutMode;
+      for (const child of n.children) clone(child, result);
+      return result;
+    };
+    const root = clone(source, f.api.currentPage);
+    const data = new Map<string, string>();
+    const key = 'responsive_layout_copy';
+    if (source.getPluginData(key)) data.set(key, source.getPluginData(key));
+    root.getPluginData = (name: string) => data.get(name) ?? '';
+    root.setPluginData = (name: string, value: string) => data.set(name, value);
+    return { root, copied };
   };
   return {
     ...f,
@@ -87,6 +133,7 @@ const fixture = () => {
     savePrivate,
     owner,
     tick,
+    cloneRoot,
   };
 };
 const deferred = () => {
@@ -100,6 +147,136 @@ beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
 
 describe('private responsive ownership', () => {
+  it('a Figma-style copy inherits rules and targets its own nodes on resize', async () => {
+    const f = fixture();
+    f.savePrivate();
+    const c = createPrivateResponsiveController(f.api);
+    c.start();
+    await f.tick();
+    const copy = f.cloneRoot();
+    copy.root.width = 597;
+    f.writes.length = 0;
+    await f.tick({ nodeChanges: [{ type: 'CREATE', node: copy.root }] } as NodeChangeEvent);
+    expect(c.get()).toMatchObject({
+      config: {
+        roots: [
+          { rootId: 'r' },
+          {
+            rootId: 'copy-r',
+            mainId: 'copy-main',
+            bodyId: 'copy-body',
+            sectionIds: ['copy-section'],
+            gridIds: ['copy-f'],
+            navigation: { instanceId: 'copy-nav', tabsNodeId: 'copy-tabs' },
+          },
+        ],
+      },
+      roots: [
+        { rootId: 'r', columns: 2 },
+        { rootId: 'copy-r', status: 'active', columns: 1 },
+      ],
+    });
+    expect(copy.copied.get('sidebar').visible).toBe(false);
+    expect(copy.copied.get('header').visible).toBe(true);
+    expect(copy.copied.get('f').gridColumnCount).toBe(1);
+    expect(f.frame.gridColumnCount).toBe(2);
+    expect(f.writes.filter(w => w.nodeId === 'f')).toEqual([]);
+    copy.root.width = 1280;
+    await f.tick();
+    expect(copy.copied.get('f').gridColumnCount).toBe(4);
+    expect(copy.copied.get('sidebar').visible).toBe(true);
+    c.dispose();
+  });
+  it('inherited copies persist and can themselves be copied', async () => {
+    const f = fixture();
+    f.savePrivate();
+    const first = createPrivateResponsiveController(f.api);
+    first.start();
+    await f.tick();
+    const copy = f.cloneRoot();
+    await f.tick();
+    first.dispose();
+    const second = createPrivateResponsiveController(f.api);
+    second.start();
+    const next = f.cloneRoot(copy.root, 'next');
+    next.root.width = 1024;
+    await f.tick();
+    expect(second.get()).toMatchObject({
+      roots: [
+        { rootId: 'r' },
+        { rootId: 'copy-r' },
+        { rootId: 'next-copy-r', status: 'active', columns: 3 },
+      ],
+    });
+    expect(next.copied.get('copy-f').gridColumnCount).toBe(3);
+    expect(JSON.parse(f.saved.get('responsive_layout_v1')!).config.roots).toHaveLength(3);
+    second.dispose();
+  });
+  it('copies made while disabled remain untouched until explicitly enabled', async () => {
+    const f = fixture();
+    f.savePrivate();
+    const c = createPrivateResponsiveController(f.api);
+    c.start();
+    await f.tick();
+    await c.configure({ enabled: false });
+    const copy = f.cloneRoot();
+    copy.root.width = 390;
+    f.writes.length = 0;
+    await f.tick();
+    expect(f.writes).toEqual([]);
+    expect(copy.copied.get('f').gridColumnCount).toBe(2);
+    await c.configure({ enabled: true });
+    expect(copy.copied.get('f').gridColumnCount).toBe(1);
+    c.dispose();
+  });
+  it('does not guess targets in a copy whose controlled structure changed', async () => {
+    const f = fixture();
+    f.savePrivate();
+    const c = createPrivateResponsiveController(f.api);
+    c.start();
+    await f.tick();
+    const copy = f.cloneRoot();
+    copy.copied.get('section').name = 'different structure';
+    copy.root.width = 390;
+    f.writes.length = 0;
+    await f.tick();
+    expect(c.get()).toMatchObject({ config: { roots: [{ rootId: 'r' }] } });
+    expect((c.get() as any).config.roots).toHaveLength(1);
+    expect(c.get()).toMatchObject({
+      copyErrors: [{ rootId: 'copy-r', error: expect.stringContaining('structure') }],
+    });
+    expect(f.writes.filter(w => w.nodeId.startsWith('copy-'))).toEqual([]);
+    c.dispose();
+  });
+  it('ignores lookalike frames without copy provenance', async () => {
+    const f = fixture();
+    f.savePrivate();
+    const c = createPrivateResponsiveController(f.api);
+    c.start();
+    await f.tick();
+    const copy = f.cloneRoot();
+    copy.root.setPluginData('responsive_layout_copy', '');
+    copy.root.width = 390;
+    f.writes.length = 0;
+    await f.tick();
+    expect((c.get() as any).config.roots).toHaveLength(1);
+    expect(f.writes.filter(w => w.nodeId.startsWith('copy-'))).toEqual([]);
+    c.dispose();
+  });
+  it('removes deleted inherited roots from the saved configuration', async () => {
+    const f = fixture();
+    f.savePrivate();
+    const c = createPrivateResponsiveController(f.api);
+    c.start();
+    await f.tick();
+    const copy = f.cloneRoot();
+    await f.tick();
+    copy.root.removed = true;
+    await f.tick();
+    expect((c.get() as any).config.roots).toHaveLength(1);
+    expect(JSON.parse(f.saved.get('responsive_layout_v1')!).config.roots).toHaveLength(1);
+    c.dispose();
+  });
   it('legacy values remain unchanged and are not accepted by the public parser', async () => {
     const f = fixture();
     expect(ResponsiveLayoutConfigSchema.safeParse(legacyConfig).success).toBe(false);

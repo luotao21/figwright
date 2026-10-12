@@ -9,6 +9,61 @@ import { withInstanceIdLookup } from './node-lookup.js';
 const KEY = 'responsive_layout_v1';
 const SavedSchema = z.object({ enabled: z.boolean(), config: PrivateResponsiveLayoutConfigSchema });
 type RootConfig = PrivateResponsiveLayoutConfig['roots'][number];
+const COPY_KEY = 'responsive_layout_copy';
+const CopyTemplateSchema = z.object({
+  version: z.literal(1),
+  fileName: z.string(),
+  pageId: z.string(),
+  root: PrivateResponsiveLayoutConfigSchema.shape.roots.element,
+  paths: z.record(
+    z.string(),
+    z.array(
+      z.object({
+        index: z.number().int().nonnegative(),
+        type: z.string(),
+        name: z.string(),
+      }),
+    ),
+  ),
+});
+const targetIds = (c: RootConfig): string[] => [
+  ...new Set([
+    c.rootId,
+    c.mainId,
+    c.bodyId,
+    ...c.sectionIds,
+    ...c.gridIds,
+    ...(c.sidebarId === undefined ? [] : [c.sidebarId]),
+    ...(c.mobileHeaderId === undefined ? [] : [c.mobileHeaderId]),
+    ...(c.navigation === undefined ? [] : [c.navigation.instanceId, c.navigation.tabsNodeId]),
+  ]),
+];
+const remapRoot = (c: RootConfig, ids: Map<string, string>): RootConfig => {
+  const id = (old: string): string => {
+    const next = ids.get(old);
+    if (next === undefined) throw new Error(`Missing copied target ${old}`);
+    return next;
+  };
+  return {
+    ...c,
+    rootId: id(c.rootId),
+    mainId: id(c.mainId),
+    bodyId: id(c.bodyId),
+    sectionIds: c.sectionIds.map(id),
+    gridIds: c.gridIds.map(id),
+    ...(c.sidebarId === undefined ? {} : { sidebarId: id(c.sidebarId) }),
+    ...(c.mobileHeaderId === undefined ? {} : { mobileHeaderId: id(c.mobileHeaderId) }),
+    ...(c.navigation === undefined
+      ? {}
+      : {
+          navigation: {
+            ...c.navigation,
+            instanceId: id(c.navigation.instanceId),
+            tabsNodeId: id(c.navigation.tabsNodeId),
+          },
+        }),
+  };
+};
 
 interface RootState {
   rootId: string;
@@ -68,6 +123,8 @@ export const createPrivateResponsiveLayoutController = (figmaApi: typeof figma) 
   let timer: ReturnType<typeof setTimeout> | undefined;
   let running: Promise<void> | undefined;
   const pendingRoots = new Set<string>();
+  const pendingCopies = new Set<FrameNode>();
+  const copyErrors = new Map<string, string>();
   let started = false;
   let disposed = false;
   let generation = 0;
@@ -110,7 +167,101 @@ export const createPrivateResponsiveLayoutController = (figmaApi: typeof figma) 
     if (timer !== undefined) clearTimeout(timer);
     timer = undefined;
     pendingRoots.clear();
+    pendingCopies.clear();
     running = undefined;
+  };
+  const collectCopies = (): void => {
+    if (config === null || !current(generation, config)) return;
+    const registered = new Set(config.roots.map(c => c.rootId));
+    for (const candidate of figmaCtx.currentPage.children)
+      if (
+        candidate.type === 'FRAME' &&
+        !registered.has(candidate.id) &&
+        candidate.getPluginData(COPY_KEY) !== ''
+      )
+        pendingCopies.add(candidate);
+  };
+  const inheritCopies = (cfg: PrivateResponsiveLayoutConfig, epoch: number): void => {
+    for (const candidate of pendingCopies) {
+      pendingCopies.delete(candidate);
+      if (!current(epoch, cfg)) return;
+      if (
+        candidate.removed ||
+        candidate.parent?.id !== cfg.pageId ||
+        cfg.roots.some(c => c.rootId === candidate.id)
+      )
+        continue;
+      try {
+        const template = CopyTemplateSchema.parse(JSON.parse(candidate.getPluginData(COPY_KEY)));
+        if (
+          template.fileName !== cfg.fileName ||
+          template.pageId !== cfg.pageId ||
+          template.root.rootId === candidate.id
+        )
+          continue;
+        const ids = new Map<string, string>();
+        for (const oldId of targetIds(template.root)) {
+          const path = template.paths[oldId];
+          if (path === undefined) throw new Error(`Missing copied path for ${oldId}`);
+          let found: BaseNode = candidate;
+          for (const step of path) {
+            const next: BaseNode | undefined =
+              'children' in found ? found.children[step.index] : undefined;
+            if (next === undefined || next.type !== step.type || next.name !== step.name)
+              throw new Error(`Copied structure no longer matches ${oldId}`);
+            found = next;
+          }
+          if (found.removed) throw new Error(`Copied target ${oldId} was removed`);
+          ids.set(oldId, found.id);
+        }
+        const inherited = { ...remapRoot(template.root, ids), copiedFrom: template.root.rootId };
+        const next = PrivateResponsiveLayoutConfigSchema.parse({
+          ...cfg,
+          roots: [...cfg.roots, inherited],
+        });
+        validateRules(next);
+        // Persist new identities before applying. Only provenance-bearing copies on the owned page qualify.
+        if (!current(epoch, cfg)) return;
+        figmaCtx.root.setPluginData(KEY, JSON.stringify({ enabled, config: next }));
+        cfg.roots = next.roots;
+        pendingRoots.add(candidate.id);
+        copyErrors.delete(candidate.id);
+      } catch (error) {
+        if (current(epoch, cfg))
+          copyErrors.set(candidate.id, error instanceof Error ? error.message : String(error));
+      }
+    }
+  };
+  const saveCopyTemplate = async (
+    root: FrameNode,
+    c: RootConfig,
+    cfg: PrivateResponsiveLayoutConfig,
+    epoch: number,
+  ): Promise<void> => {
+    const paths: z.infer<typeof CopyTemplateSchema>['paths'] = {};
+    for (const id of targetIds(c)) {
+      // eslint-disable-next-line no-await-in-loop -- references are already cached by validation
+      let target = await node(id);
+      const path: z.infer<typeof CopyTemplateSchema>['paths'][string] = [];
+      while (target !== root) {
+        if (target === null || target.parent === null || !('children' in target.parent))
+          throw new Error(`Cannot locate copied target ${id}`);
+        const index = target.parent.children.indexOf(target as SceneNode);
+        if (index < 0) throw new Error(`Cannot locate copied target ${id}`);
+        path.unshift({ index, type: target.type, name: target.name });
+        target = target.parent;
+      }
+      paths[id] = path;
+    }
+    if (!current(epoch, cfg)) return;
+    const value = JSON.stringify({
+      version: 1,
+      fileName: cfg.fileName,
+      pageId: cfg.pageId,
+      root: c,
+      paths,
+    });
+    if (root.getPluginData(COPY_KEY) !== value) root.setPluginData(COPY_KEY, value);
   };
   const applyRoot = async (
     c: RootConfig,
@@ -309,6 +460,9 @@ export const createPrivateResponsiveLayoutController = (figmaApi: typeof figma) 
         navigation = compact ? 'select' : 'tabs';
       }
       if (!current(epoch, cfg)) return;
+      phase = 'save copy template';
+      await saveCopyTemplate(root, c, cfg, epoch);
+      if (!current(epoch, cfg)) return;
       states.set(c.rootId, {
         rootId: c.rootId,
         status: 'active',
@@ -333,11 +487,28 @@ export const createPrivateResponsiveLayoutController = (figmaApi: typeof figma) 
     if (running !== undefined) return running;
     const epoch = generation;
     const work = (async () => {
+      const initial = config;
+      if (initial !== null && current(epoch, initial)) {
+        const surviving = await Promise.all(
+          initial.roots.map(async c => {
+            if (c.copiedFrom === undefined) return c;
+            const found = await node(c.rootId);
+            return found === null || found.removed ? null : c;
+          }),
+        );
+        if (!current(epoch, initial)) return;
+        if (surviving.some(c => c === null)) {
+          const next = { ...initial, roots: surviving.filter((c): c is RootConfig => c !== null) };
+          figmaCtx.root.setPluginData(KEY, JSON.stringify({ enabled, config: next }));
+          initial.roots = next.roots;
+        }
+      }
       // Document-change notifications from our writes may request one more pass. Equality guards
       // make that pass a no-op; no timer loop and no user edits are swallowed.
-      while (pendingRoots.size > 0) {
+      while (pendingRoots.size > 0 || pendingCopies.size > 0) {
         const cfg = config;
         if (cfg === null || !current(epoch, cfg)) break;
+        inheritCopies(cfg, epoch);
         const ids = new Set(pendingRoots);
         pendingRoots.clear();
         for (const root of cfg.roots) {
@@ -356,6 +527,7 @@ export const createPrivateResponsiveLayoutController = (figmaApi: typeof figma) 
     if (!enabled || disposed) return;
     const cfg = config;
     if (cfg === null || !current(generation, cfg)) return;
+    if (event === undefined) collectCopies();
     if (event === undefined || event.nodeChanges.some(change => change.type === 'DELETE')) {
       for (const root of cfg.roots) pendingRoots.add(root.rootId);
     } else {
@@ -367,11 +539,19 @@ export const createPrivateResponsiveLayoutController = (figmaApi: typeof figma) 
             pendingRoots.add(changed.id);
             break;
           }
+          if (
+            changed.type === 'FRAME' &&
+            changed.parent?.id === cfg.pageId &&
+            changed.getPluginData(COPY_KEY) !== ''
+          ) {
+            pendingCopies.add(changed);
+            break;
+          }
           changed = changed.parent;
         }
       }
     }
-    if (pendingRoots.size === 0) return;
+    if (pendingRoots.size === 0 && pendingCopies.size === 0) return;
     if (timer !== undefined) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = undefined;
@@ -383,6 +563,9 @@ export const createPrivateResponsiveLayoutController = (figmaApi: typeof figma) 
     config,
     error: loadError,
     dependency: 'Figwright plugin must remain open',
+    ...(copyErrors.size === 0
+      ? {}
+      : { copyErrors: [...copyErrors].map(([rootId, error]) => ({ rootId, error })) }),
     roots:
       config?.roots.map(
         (c): RootState =>
@@ -412,6 +595,7 @@ export const createPrivateResponsiveLayoutController = (figmaApi: typeof figma) 
     config = next;
     loadError = undefined;
     states.clear();
+    copyErrors.clear();
     pendingRoots.clear();
     refs.clear();
     tokens.clear();
@@ -422,6 +606,7 @@ export const createPrivateResponsiveLayoutController = (figmaApi: typeof figma) 
     updateWatch();
     if (enabled) {
       for (const root of next!.roots) pendingRoots.add(root.rootId);
+      collectCopies();
       await apply();
     }
     return { ok: true, ...get() };

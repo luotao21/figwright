@@ -2,7 +2,7 @@ import { z } from 'zod';
 
 const id = z.string().min(1);
 
-/** Opt-in layout ownership. No implicit page scan, component creation, or token creation. */
+/** Explicit ownership and provenance-bearing copies; no heuristic matching or asset creation. */
 export const PrivateResponsiveLayoutConfigSchema = z.object({
   fileName: id,
   pageId: id,
@@ -25,6 +25,7 @@ export const PrivateResponsiveLayoutConfigSchema = z.object({
     .array(
       z.object({
         rootId: id,
+        copiedFrom: id.optional(),
         mainId: id,
         bodyId: id,
         sectionIds: z.array(id).min(1),
